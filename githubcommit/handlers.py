@@ -2,7 +2,8 @@ from notebook.utils import url_path_join as ujoin
 from notebook.base.handlers import IPythonHandler
 import os, json, git, urllib, requests
 from git import Repo, GitCommandError
-from subprocess import check_output
+from subprocess import check_output, call
+from os.path import expanduser
 
 class GitCommitHandler(IPythonHandler):
 
@@ -18,19 +19,23 @@ class GitCommitHandler(IPythonHandler):
 
         # git parameters from environment variables
         # expand variables since Docker's will pass VAR=$VAL as $VAL without expansion
-        git_dir = "{}/{}".format(os.path.expandvars(os.environ.get('GIT_PARENT_DIR')), os.path.expandvars(os.environ.get('GIT_REPO_NAME')))
-        git_url = os.path.expandvars(os.environ.get('GIT_REMOTE_URL'))
-        git_user = os.path.expandvars(os.environ.get('GIT_USER'))
-        git_repo_upstream = os.path.expandvars(os.environ.get('GIT_REMOTE_UPSTREAM'))
-        git_branch = git_remote = os.path.expandvars(os.environ.get('GIT_BRANCH_NAME'))
-        git_access_token = os.path.expandvars(os.environ.get('GITHUB_ACCESS_TOKEN'))
+        data = json.loads(self.request.body.decode('utf-8'))
+        git_dir = "{}/{}".format(expanduser("~"), data['filepath'])
+        
+        # Grant read access permission for settings file: get Git Remote
+        settings_dir = os.path.expandvars(os.environ.get('GIT_SETTINGS_FILE'))
+        file = open(settings_dir, "r")
+        
+        data = json.loads(file.read())
+        git_remote = data['branch-name']
+        git_url = check_output(['git', 'config', '--get', 'remote.origin.url']).strip()
 
         # get the parent directory for git operations
         git_dir_parent = os.path.dirname(git_dir)
 
-        # obtain filename and msg for commit
+    try:
+        # obtain commit message
         data = json.loads(self.request.body.decode('utf-8'))
-        filename = urllib.parse.unquote(data['filename'])
         msg = data['msg']
 
         # get current directory (to return later)
@@ -41,70 +46,96 @@ class GitCommitHandler(IPythonHandler):
             os.chdir(git_dir)
             dir_repo = check_output(['git','rev-parse','--show-toplevel']).strip()
             repo = Repo(dir_repo.decode('utf8'))
-        except GitCommandError as e:
-            self.error_and_return(cwd, "Could not checkout repo: {}".format(dir_repo))
+            os.chdir(dir_repo)
+        except ValueError:
             return
-
-        # create new branch
-        try:
-            print(repo.git.checkout('HEAD', b=git_branch))
-        except GitCommandError:
-            print("Switching to {}".format(repo.heads[git_branch].checkout()))
+        except GitCommandError as e:
+            self.error_and_return(cwd, "Could not checkout repo: {}{}".format(dir_repo, git_dir))
+            return
 
         # commit current notebook
         # client will sent pathname containing git directory; append to git directory's parent
         try:
-            print(repo.git.add(str(os.path.expanduser('~') + "/" + os.environ.get('GIT_REPO_NAME') + filename)))
-            print(repo.git.commit( a=True, m="{}\n\nUpdated {}".format(msg, filename) ))
+            check_output(['git', 'add', '--all']).strip()
+            call(['git', 'commit', '-m', msg])
         except GitCommandError as e:
             print(e)
-            self.error_and_return(cwd, "Could not commit changes to notebook: {}".format(git_dir_parent + filename))
+            self.error_and_return(cwd, "Could not commit changes to notebook: "+ git_dir )
             return
-
-        # create or switch to remote
-        try:
-            remote = repo.create_remote(git_remote, git_url)
-        except GitCommandError:
-            print("Remote {} already exists...".format(git_remote))
-            remote = repo.remote(git_remote)
 
         # push changes
         try:
-            pushed = remote.push(git_branch)
-            assert len(pushed)>0
-            assert pushed[0].flags in [git.remote.PushInfo.UP_TO_DATE, git.remote.PushInfo.FAST_FORWARD, git.remote.PushInfo.NEW_HEAD, git.remote.PushInfo.NEW_TAG]
+            pushed = check_output(['git', 'push']).strip()
         except GitCommandError as e:
             print(e)
-            self.error_and_return(cwd, "Could not push to remote {}".format(git_remote))
+            self.error_and_return(cwd, "Could not push to remote {}".format(git_remote) + os.path.expanduser('~'))
             return
-        except AssertionError as e:
-            self.error_and_return(cwd, "Could not push to remote {}: {}".format(git_remote, pushed[0].summary))
-            return
-
-        # open pull request
-        try:
-          github_url = "https://api.github.com/repos/{}/pulls".format(git_repo_upstream)
-          github_pr = {
-              "title":"{} Notebooks".format(git_user),
-              "body":"IPython notebooks submitted by {}".format(git_user),
-              "head":"{}:{}".format(git_user, git_remote),
-              "base":"master"
-          }
-          github_headers = {"Authorization": "token {}".format(git_access_token)}
-          r = requests.post(github_url, data=json.dumps(github_pr), headers=github_headers)
-          if r.status_code != 201:
-            print("Error submitting Pull Request to {}".format(git_repo_upstream))
-        except:
-            print("Error submitting Pull Request to {}".format(git_repo_upstream))
+            
+        result = check_output(['bash', '-c', "git push"])
 
         # return to directory
         os.chdir(cwd)
 
         # close connection
-        self.write({'status': 200, 'statusText': 'Success!  Changes to {} captured on branch {} at {}'.format(filename, git_branch, git_url)})
+        self.write({'status': 200, 'statusText': 'Success! Changes are pushed.'})
 
+class GitSettingsHandler(IPythonHandler):
+
+    def error_and_return(self, dirname, reason):
+
+        # send error
+        self.send_error(501, reason=reason+'test')
+        
+        # return to directory
+        os.chdir(dirname)
+        
+    def post(self):
+        data = json.loads(self.request.body.decode('utf-8'))
+        git_dir = "{}{}".format(expanduser("~"), data['filepath'])
+        os.chdir(git_dir)
+
+        try:
+            ssh_dir = os.path.expandvars(os.environ.get('GIT_PUBKEY_FILE'))
+            settings_dir = os.path.expandvars(os.environ.get('GIT_SETTINGS_FILE'))
+            dir_repo = check_output(['git','rev-parse','--show-toplevel']).strip()
+            repo = Repo(dir_repo.decode('utf8'))
+            
+
+            # append the received JSON object with additional git values: SSH Key, Git Parent-Direction, Remote-URL
+            file = open(ssh_dir, "r")
+            data['key'] = file.read()
+            data['parent-dir'] = os.environ.get('GIT_PARENT_DIR')
+            data['remote-url'] = repo.remotes.origin.url
+            
+            # set your user name and email address - obligatory information for git commits
+            check_output(['git','config','user.email',data['email']]).strip()
+            check_output(['git','config','user.name',data['user']]).strip()
+            
+            # JSON file: If none exists, create a new file and grant write access permission
+            the_file = open(settings_dir, 'w+')
+            the_file.write(json.dumps(data))
+            the_file.close();
+
+        except ValueError:
+            print("Error: saving JSON file failed.")
+
+        self.write({'status': 200, 'statusText': 'Success! Settings file saved.'})
+
+    def get(self):
+        settings_dir = os.path.expandvars(os.environ.get('GIT_SETTINGS_FILE'))
+  
+        try:
+            file = open(settings_dir, "r")
+            json = file.read()
+            self.write({'status': 200, 'statusText': 'Success! loading settings', 'msg': json})
+            file.close();
+        except ValueError:
+            print("Error reading file")
+            self.write({'status': 404, 'statusText': 'file not found'})
 
 def setup_handlers(nbapp):
-    route_pattern = ujoin(nbapp.settings['base_url'], '/git/commit')
+    route_pattern = r"/user/\w+/notebooks/git/commit"
     nbapp.add_handlers('.*', [(route_pattern, GitCommitHandler)])
+    route_pattern = r"/user/\w+/notebooks/settings"
+    nbapp.add_handlers('.*', [(route_pattern, GitSettingsHandler)])
 
